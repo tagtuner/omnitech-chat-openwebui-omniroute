@@ -1,0 +1,52 @@
+# OmniTech Chat — Open WebUI (example)
+# Copy to your host, fill .env, adjust LAN bind IP.
+# NEVER commit real API keys or Jupyter tokens.
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      # Bind to LAN IP only — replace with your host IP
+      - "LAN_IP:3080:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      ENABLE_OLLAMA_API: "false"
+      OPENAI_API_BASE_URL: "${OPENAI_API_BASE_URL}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      WEBUI_NAME: "OmniTech Chat"
+      DEFAULT_MODELS: "auto/best-coding;auto/best-reasoning;auto/best-fast;auto/best-chat;auto/best-vision;auto/best-coding-fast"
+
+      # Stability / UX
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "true"
+      ENABLE_SEARCH_QUERY_GENERATION: "true"
+
+      # Web search (DuckDuckGo — no vendor API key)
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: "duckduckgo"
+      WEB_SEARCH_RESULT_COUNT: "5"
+      USER_PERMISSIONS_FEATURES_WEB_SEARCH: "true"
+
+      # Optional: Code Interpreter / Jupyter — fill from .env if used
+      # ENABLE_CODE_INTERPRETER: "true"
+      # CODE_INTERPRETER_ENGINE: "jupyter"
+      # CODE_INTERPRETER_JUPYTER_URL: "http://owui-jupyter:8888"
+      # CODE_INTERPRETER_JUPYTER_AUTH: "token"
+      # CODE_INTERPRETER_JUPYTER_AUTH_TOKEN: "${JUPYTER_TOKEN}"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      # - omnitech_ai   # optional external network shared with OmniRoute
+
+volumes:
+  open-webui-data:
+
+# networks:
+#   omnitech_ai:
+#     external: true
