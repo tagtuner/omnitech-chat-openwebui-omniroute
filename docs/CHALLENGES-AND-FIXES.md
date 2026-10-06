@@ -81,6 +81,31 @@ DuckDuckGo needs **no API key**. Smoke from container with `ddgs`.
 - Disable signup after named users exist.
 - Separate restricted key for UI client vs full admin/Continue key.
 
+## 9) Incomplete Excel from RAG chunks (FULL_FILE_READ)
+
+**Challenge:** Attached survey spreadsheet → Subject-wise Excel showed only **2 subjects**. Model used RAG “1 source” snippets and invented rows.
+
+**Fix:**
+- Tools read the **complete `.xlsx` from disk** (`lib_source_workbook.py`) — never chat RAG invent.
+- Generate Excel / Word / PDF / Slides: `job=subject_group_report` (+ `source_file_id` / `__files__`).
+- Generate Forecast Pack: `job=forecast_from_source` (prefer sheets **AS GB + A2 GB**).
+- File Job Follow-up filter forces the job= path when a sheet is attached.
+- Deploy helpers: `install_full_source_tools.py`, `install_forecast_pack_full_source.py`.
+- Acceptance: survey VERIFY **105 rows / 11 subjects**; Forecast Pack smoke with AS+A2 GB.
+
+## 10) Same-chat “cooling down” / Maximum combo
+
+**Challenge:** After a successful tool reply, the **next** message in the same chat failed with all credentials cooling down / combo retry — users thought they must open a new chat.
+
+**Root cause:** Virtual `auto/best-fast` hunted dozens of dead upstream models (403/400/429 / no-balance), burned lockouts, then failed the request.
+
+**Fix:**
+- Keep only proven providers **ON** (e.g. gemini, alibaba, opencode, cloudflare-ai, deepseek, grok-cli).
+- Force **OFF** burners (zai/github/huggingface/groq/mistral/web CLIs that 403, etc.).
+- Soften `modelLockout` (`baseCooldownMs` / `maxCooldownMs`) so one 429 does not brick the thread for minutes.
+- Script: `deploy/harden_bestfast_combo.py`.
+- Teach: **same chat regenerate/retry** — do not require a new chat.
+
 ---
 
 ## Verification gates (definition of “flawless”)
@@ -89,10 +114,12 @@ DuckDuckGo needs **no API key**. Smoke from container with `ddgs`.
 - [ ] Non-admin sees Generate* tools after ACL  
 - [ ] Web Search returns cited answers  
 - [ ] Forecast / office tool returns downloadable Files API link  
+- [ ] Attached survey → FULL_FILE_READ VERIFY (complete subjects/rows, not RAG invent)  
+- [ ] Same-chat follow-up after tools works (combo harden; no forced new chat)  
 - [ ] Chip follow-ups remain OFF  
 - [ ] `mce_watch` quiet after RAM hygiene  
 - [ ] Survive reboot + short heal wait without manual rewire  
 
 ---
 
-*Captured 2026-08 — OmniTech production notes. Sanitize hostnames/IPs before publishing customer-specific forks.*
+*Captured 2026-08 … updated 2026-10 — OmniTech production notes. Sanitize hostnames/IPs/user ids before publishing customer-specific forks.*

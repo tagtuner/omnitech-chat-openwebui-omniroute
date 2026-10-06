@@ -1,10 +1,10 @@
 """
 title: Generate Excel
 author: OmniTech
-description: Generate native Excel (.xlsx) workbooks from a JSON spec.
+description: Generate native Excel (.xlsx). Prefer FULL attached-file read via source_file_id/job — never RAG chunks.
 requirements: openpyxl
 required_open_webui_version: 0.4.0
-version: 1.0.0
+version: 2.0.0
 license: MIT
 """
 
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -30,6 +31,19 @@ try:
     _HAS_XLSX = True
 except Exception:
     _HAS_XLSX = False
+
+
+def _load_source_lib():
+    for p in (
+        "/app/backend/data",
+        "/opt/open-webui/tools",
+        os.path.dirname(os.path.abspath(__file__)),
+    ):
+        if p and p not in sys.path and os.path.isdir(p):
+            sys.path.insert(0, p)
+    import lib_source_workbook as sw  # type: ignore
+
+    return sw
 
 
 def _slugify(text: str) -> str:
@@ -294,29 +308,29 @@ class Tools:
     async def generate_excel(
         self,
         content: str = "{}",
+        source_file_id: str = "",
+        source_filename: str = "",
+        job: str = "",
+        sheet_name: str = "",
+        group_by: str = "Subject",
+        __files__: Optional[list] = None,
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __request__: Any = None,
     ) -> str:
         """Create a native Excel (.xlsx) workbook and return a download link.
-        Use when the user asks for Excel, XLSX, spreadsheet, workbook, or data export.
 
-        `content` MUST be a SINGLE JSON string (no markdown fence):
-        {
-          "title": "Workbook title",
-          "author": "...",
-          "sheets": [
-            {
-              "name": "AS",
-              "title": "AS Summary",
-              "stats": [{"label":"On target","value":"43%"}],
-              "headers": ["Name","Forecast","CAIE","Δ"],
-              "rows": [["Aisha","A","B",-1]],
-              "notes": ["optional"]
-            }
-          ]
-        }
-        Or single-sheet: top-level headers/rows/stats.
+        FULL-FILE RULE (mandatory when a spreadsheet is attached):
+        - Pass source_file_id from the attached file (or leave blank to auto-pick chat .xlsx).
+        - Set job to one of:
+          - subject_group_report — group ALL rows by Subject (or group_by); one sheet per group + Overview
+          - mirror_workbook — copy every sheet/row from the source file exactly
+          - full_sheet_tables — export chosen sheet (all rows) as data sheets
+        - Do NOT invent rows from chat/RAG snippets. This tool reads the complete file on disk.
+
+        Optional `content` JSON (blank/new workbooks only — ignored for data when job+source set):
+        { "title":"...", "sheets":[{"name":"...","headers":[...],"rows":[[...]]}] }
+
         Reproduce the returned markdown link EXACTLY (do NOT prefix sandbox:).
         """
         if not _HAS_XLSX:
@@ -324,10 +338,166 @@ class Tools:
                 "[TOOL_RESULT — use as final reply]\n\n"
                 "I couldn't generate the Excel file: openpyxl is not installed."
             )
-        try:
-            spec = _parse_content(content)
-        except Exception as exc:
-            return f"[TOOL_RESULT — use as final reply]\n\nInvalid JSON for generate_excel: {exc}"
+
+        verify_md = ""
+        job_l = (job or "").strip().lower()
+        has_source_hint = bool(
+            (source_file_id or "").strip()
+            or (source_filename or "").strip()
+            or job_l
+            or __files__
+        )
+
+        # Auto job when files attached and job blank but content empty/default
+        if has_source_hint and not job_l:
+            # If content already has real sheets/rows, allow legacy path unless source_file_id set
+            if (source_file_id or "").strip() or (source_filename or "").strip():
+                job_l = "subject_group_report"
+
+        if job_l in (
+            "subject_group_report",
+            "subjectwise",
+            "subject_wise",
+            "subject-wise",
+            "mirror_workbook",
+            "mirror",
+            "full_sheet_tables",
+            "full_sheet",
+        ):
+            try:
+                sw = _load_source_lib()
+                uid = __user__.get("id") if isinstance(__user__, dict) else None
+                fid, filename, path = sw.resolve_file_path(
+                    source_file_id=source_file_id,
+                    source_filename=source_filename,
+                    files=__files__ or [],
+                    user_id=uid,
+                )
+                if __event_emitter__:
+                    try:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"FULL_FILE_READ · {filename}…",
+                                    "done": False,
+                                },
+                            }
+                        )
+                    except Exception:
+                        pass
+                book = sw.load_workbook_rows(path)
+                if job_l in ("mirror_workbook", "mirror"):
+                    sheets = []
+                    for s in book["sheets"]:
+                        sheets.append(
+                            {
+                                "name": s["name"][:31],
+                                "title": s["name"],
+                                "headers": s["headers"],
+                                "rows": [
+                                    [("" if c is None else c) for c in row]
+                                    for row in s["rows"]
+                                ],
+                                "stats": [
+                                    {
+                                        "label": "Rows",
+                                        "value": str(s["row_count"]),
+                                    }
+                                ],
+                                "notes": ["FULL_FILE_READ mirror — complete sheet"],
+                            }
+                        )
+                    spec = {
+                        "title": f"Mirror · {filename}",
+                        "author": "OmniTech FULL_FILE_READ",
+                        "sheets": sheets,
+                    }
+                    verify_md = (
+                        f"**VERIFY · FULL_FILE_READ**\n- Source: `{filename}` (`{fid}`)\n"
+                        f"- Sheets: {len(sheets)}\n"
+                        f"- Total data rows: **{book['total_data_rows']}**"
+                    )
+                elif job_l in ("full_sheet_tables", "full_sheet"):
+                    s = None
+                    for cand in book["sheets"]:
+                        if not sheet_name or sheet_name.lower() in cand["name"].lower():
+                            s = cand
+                            if sheet_name:
+                                break
+                    if s is None:
+                        s = book["sheets"][0]
+                    spec = {
+                        "title": f"{s['name']} · full export",
+                        "author": "OmniTech FULL_FILE_READ",
+                        "sheets": [
+                            {
+                                "name": s["name"][:31],
+                                "title": s["name"],
+                                "headers": s["headers"],
+                                "rows": [
+                                    [("" if c is None else c) for c in row]
+                                    for row in s["rows"]
+                                ],
+                                "stats": [
+                                    {"label": "Rows", "value": str(s["row_count"])}
+                                ],
+                                "notes": ["FULL_FILE_READ — all rows"],
+                            }
+                        ],
+                    }
+                    verify_md = (
+                        f"**VERIFY · FULL_FILE_READ**\n- Source: `{filename}` (`{fid}`)\n"
+                        f"- Sheet: `{s['name']}`\n- Rows: **{s['row_count']}**"
+                    )
+                else:
+                    # parse optional title from content
+                    title = "Subject-wise Report"
+                    try:
+                        meta = _parse_content(content) if content and content.strip() not in ("{}", "") else {}
+                        if isinstance(meta, dict) and meta.get("title"):
+                            title = str(meta["title"])
+                    except Exception:
+                        pass
+                    built = sw.build_subject_group_report(
+                        book,
+                        sheet_name=sheet_name or "Form Responses 1",
+                        group_by=group_by or "Subject",
+                        title=title,
+                    )
+                    spec = built["excel"]
+                    verify_md = sw.verify_block_markdown(
+                        built["verify"], fid, filename
+                    )
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"FULL_FILE_READ failed: {exc}\n\n"
+                    "Attach the .xlsx again and call generate_excel with "
+                    "job='subject_group_report' (or mirror_workbook)."
+                )
+        else:
+            try:
+                spec = _parse_content(content)
+            except Exception as exc:
+                return f"[TOOL_RESULT — use as final reply]\n\nInvalid JSON for generate_excel: {exc}"
+            # Guard: refuse tiny invented reports when chat has spreadsheet attaches
+            if __files__:
+                xlsx_attached = False
+                for item in __files__ or []:
+                    if not isinstance(item, dict):
+                        continue
+                    n = str(item.get("filename") or item.get("name") or "").lower()
+                    if n.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                        xlsx_attached = True
+                        break
+                if xlsx_attached:
+                    return (
+                        "[TOOL_RESULT — use as final reply]\n\n"
+                        "A spreadsheet is attached. Do **not** pass hand-built rows from chat/RAG. "
+                        "Call again with job='subject_group_report' (or mirror_workbook / full_sheet_tables) "
+                        "so the tool can FULL_FILE_READ the attached file."
+                    )
 
         if __event_emitter__:
             try:
@@ -347,6 +517,7 @@ class Tools:
             return f"[TOOL_RESULT — use as final reply]\n\nXLSX built but save failed: {err}"
 
         kb = max(1, len(data) // 1024)
+        head = verify_md + "\n\n" if verify_md else ""
         if __event_emitter__:
             try:
                 await __event_emitter__(
@@ -355,6 +526,7 @@ class Tools:
                         "data": {
                             "content": (
                                 f"\n\n---\n\n📊 **Excel workbook ready** · {kb} KB\n\n"
+                                f"{head}"
                                 f"⬇️ [Download {fname}]({url})\n\n---\n"
                             )
                         },
@@ -369,6 +541,7 @@ class Tools:
         return (
             "[TOOL_RESULT — reproduce the markdown link EXACTLY as written below "
             "(do NOT change the URL, do NOT prefix sandbox:). Do not include this line.]\n\n"
+            f"{head}"
             "Here is the Excel workbook:\n\n"
             f"[{fname}]({url})"
         )

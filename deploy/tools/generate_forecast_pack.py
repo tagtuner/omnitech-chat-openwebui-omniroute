@@ -1,10 +1,10 @@
 """
 title: Generate Forecast Pack
 author: OmniTech
-description: Multi-sheet CAIE forecast pack (Summary, AS, A2, Variance) with outcome colours.
+description: Multi-sheet CAIE forecast pack. Prefer FULL attached-file read via source_file_id/job.
 requirements: openpyxl
 required_open_webui_version: 0.4.0
-version: 1.0.0
+version: 2.0.0
 license: MIT
 """
 
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -30,6 +31,19 @@ try:
     _HAS_XLSX = True
 except Exception:
     _HAS_XLSX = False
+
+
+def _load_source_lib():
+    for p in (
+        "/app/backend/data",
+        "/opt/open-webui/tools",
+        os.path.dirname(os.path.abspath(__file__)),
+    ):
+        if p and p not in sys.path and os.path.isdir(p):
+            sys.path.insert(0, p)
+    import lib_source_workbook as sw  # type: ignore
+
+    return sw
 
 NAVY = "141C2B"
 FORECAST_BLUE = "7EA8D9"
@@ -501,30 +515,33 @@ class Tools:
     async def generate_forecast_pack(
         self,
         content: str = "{}",
+        source_file_id: str = "",
+        source_filename: str = "",
+        job: str = "",
+        as_sheet: str = "",
+        a2_sheet: str = "",
+        cohort: str = "GB",
+        __files__: Optional[list] = None,
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __request__: Any = None,
     ) -> str:
         """Create a branded multi-sheet CAIE forecast Excel pack and return a download link.
 
-        Use when the user wants a forecast pack, progress pack, AS/A2 CAIE workbook,
-        or Students Progress Report style Excel with Summary + AS + A2 + Variance.
+        FULL-FILE RULE (mandatory when Students Progress / forecast spreadsheet attached):
+        - job='forecast_from_source' (or 'full_file' / 'from_source')
+        - Reads COMPLETE workbook from disk (prefer sheets AS GB + A2 GB)
+        - Never invent as_rows/a2_rows from RAG snippets
+        - Returns VERIFY block (AS/A2 row counts)
 
-        Call this AFTER the one clarification round (or immediately if they said
-        use defaults / already answered). Defaults: cohort GB, 4 sheets, colours on.
-
-        `content` MUST be a SINGLE JSON string (no markdown fence):
+        Optional blank JSON `content` only when NO source file (legacy path):
         {
           "title": "Students Progress Report 2026",
-          "subtitle": "optional",
-          "author": "Intellect School",
           "cohort": "GB",
-          "kpis": {"as_on_target_pct": 43, "a2_on_target_pct": 58, "overall_on_target_pct": 51},
           "as_rows": [{"name":"...","subject":"...","forecast":"A","caie":"B"}],
-          "a2_rows": [{"name":"...","subject":"...","forecast":"A","caie":"A"}],
-          "actions": ["Computer Science revision sessions", "..."]
+          "a2_rows": [...]
         }
-        Variance and Outcome are computed if omitted (Δ = CAIE − Forecast, A*=7).
+        Variance/Outcome computed (Δ = CAIE − Forecast, A*=7).
         Reproduce the markdown download link EXACTLY (do NOT prefix sandbox:).
         """
         if not _HAS_XLSX:
@@ -532,10 +549,111 @@ class Tools:
                 "[TOOL_RESULT — use as final reply]\n\n"
                 "I couldn't generate the forecast pack: openpyxl is not installed."
             )
-        try:
-            spec = _parse_content(content)
-        except Exception as exc:
-            return f"[TOOL_RESULT — use as final reply]\n\nInvalid JSON for generate_forecast_pack: {exc}"
+
+        verify_md = ""
+        job_l = (job or "").strip().lower()
+        if (source_file_id or source_filename or job_l or __files__) and job_l in (
+            "",
+            "forecast_from_source",
+            "full_file",
+            "from_source",
+            "full_file_read",
+            "defaults",
+        ):
+            # Auto FULL_FILE when spreadsheet attached
+            xlsx_attached = bool((source_file_id or source_filename or "").strip())
+            if not xlsx_attached:
+                for item in __files__ or []:
+                    if not isinstance(item, dict):
+                        continue
+                    n = str(item.get("filename") or item.get("name") or "").lower()
+                    if n.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                        xlsx_attached = True
+                        break
+            if xlsx_attached or job_l:
+                job_l = job_l or "forecast_from_source"
+
+        if job_l in (
+            "forecast_from_source",
+            "full_file",
+            "from_source",
+            "full_file_read",
+            "defaults",
+        ):
+            try:
+                sw = _load_source_lib()
+                uid = __user__.get("id") if isinstance(__user__, dict) else None
+                fid, filename, path = sw.resolve_file_path(
+                    source_file_id=source_file_id,
+                    source_filename=source_filename,
+                    files=__files__ or [],
+                    user_id=uid,
+                )
+                if __event_emitter__:
+                    try:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"FULL_FILE_READ · {filename}…",
+                                    "done": False,
+                                },
+                            }
+                        )
+                    except Exception:
+                        pass
+                book = sw.load_workbook_rows(path)
+                title = "Students Progress Report"
+                cohort_v = (cohort or "GB").strip() or "GB"
+                try:
+                    meta = (
+                        _parse_content(content)
+                        if content and content.strip() not in ("{}", "")
+                        else {}
+                    )
+                    if isinstance(meta, dict):
+                        if meta.get("title"):
+                            title = str(meta["title"])
+                        if meta.get("cohort"):
+                            cohort_v = str(meta["cohort"])
+                except Exception:
+                    pass
+                built = sw.build_forecast_pack_from_workbook(
+                    book,
+                    title=title,
+                    cohort=cohort_v,
+                    as_sheet=as_sheet or "",
+                    a2_sheet=a2_sheet or "",
+                )
+                spec = built["spec"]
+                verify_md = sw.verify_forecast_markdown(built["verify"], fid, filename)
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"FULL_FILE_READ failed: {exc}\n\n"
+                    "Attach the Progress Report .xlsx (sheets AS GB + A2 GB) and call "
+                    "generate_forecast_pack with job='forecast_from_source'."
+                )
+        else:
+            try:
+                spec = _parse_content(content)
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"Invalid JSON for generate_forecast_pack: {exc}"
+                )
+            if __files__:
+                for item in __files__ or []:
+                    if not isinstance(item, dict):
+                        continue
+                    n = str(item.get("filename") or item.get("name") or "").lower()
+                    if n.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                        return (
+                            "[TOOL_RESULT — use as final reply]\n\n"
+                            "Spreadsheet attached — call generate_forecast_pack with "
+                            "job='forecast_from_source' for FULL_FILE_READ "
+                            "(prefer sheets AS GB + A2 GB)."
+                        )
 
         if __event_emitter__:
             try:
@@ -557,6 +675,7 @@ class Tools:
             return f"[TOOL_RESULT — use as final reply]\n\nPack built but save failed: {err}"
 
         kb = max(1, len(data) // 1024)
+        head = verify_md + "\n\n" if verify_md else ""
         if __event_emitter__:
             try:
                 await __event_emitter__(
@@ -565,6 +684,7 @@ class Tools:
                         "data": {
                             "content": (
                                 f"\n\n---\n\n📊 **Forecast pack ready** · {kb} KB\n\n"
+                                f"{head}"
                                 f"⬇️ [Download {fname}]({url})\n\n---\n"
                             )
                         },
@@ -579,6 +699,7 @@ class Tools:
         return (
             "[TOOL_RESULT — reproduce the markdown link EXACTLY as written below "
             "(do NOT change the URL, do NOT prefix sandbox:). Do not include this line.]\n\n"
+            f"{head}"
             "Here is the forecast pack:\n\n"
             f"[{fname}]({url})"
         )

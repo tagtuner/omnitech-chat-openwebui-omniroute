@@ -2,10 +2,10 @@
 title: Generate PDF
 author: OmniTech
 author_url: https://github.com
-description: Generate native PDF reports from a JSON spec (cover, KPIs, sections, tables).
+description: Generate native PDF reports. Prefer FULL attached-file read via source_file_id/job.
 requirements: reportlab
 required_open_webui_version: 0.4.0
-version: 1.0.0
+version: 2.0.0
 license: MIT
 """
 
@@ -16,12 +16,26 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+
+def _load_source_lib():
+    for p in (
+        "/app/backend/data",
+        "/opt/open-webui/tools",
+        os.path.dirname(os.path.abspath(__file__)),
+    ):
+        if p and p not in sys.path and os.path.isdir(p):
+            sys.path.insert(0, p)
+    import lib_source_workbook as sw  # type: ignore
+
+    return sw
 
 try:
     from reportlab.lib import colors
@@ -70,6 +84,54 @@ def _hex(c: str, default: str = "141C2B") -> str:
 def _color(c: str):
     h = _hex(c)
     return colors.HexColor(f"#{h}")
+
+
+# Auto cell fills for common status/warn labels (vCenter digests, etc.)
+_STATUS_FILL = {
+    "red": ("C62828", "FFFFFF"),
+    "critical": ("C62828", "FFFFFF"),
+    "yellow": ("F9A825", "111111"),
+    "warning": ("F9A825", "111111"),
+    "green": ("2E7D32", "FFFFFF"),
+    "ok": ("2E7D32", "FFFFFF"),
+}
+_WARN_FILL = {
+    "ram": ("EA580C", "FFFFFF"),
+    "cpu": ("EA580C", "FFFFFF"),
+    "used": ("EA580C", "FFFFFF"),
+    "ram+cpu": ("EA580C", "FFFFFF"),
+    "cpu+ram": ("EA580C", "FFFFFF"),
+    "ok": ("E5E7EB", "111827"),
+}
+
+
+def _cell_text_and_colors(val: Any, header: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Return (text, bg_hex, fg_hex). Supports plain values or {text,bg,fg} dicts."""
+    bg = fg = None
+    if isinstance(val, dict):
+        text = str(val.get("text", val.get("value", "")))
+        if val.get("bg"):
+            bg = _hex(str(val["bg"]), "")
+            if not bg:
+                bg = None
+        if val.get("fg"):
+            fg = _hex(str(val["fg"]), "")
+            if not fg:
+                fg = None
+    else:
+        text = "" if val is None else str(val)
+
+    key = text.strip().lower()
+    h = (header or "").strip().lower()
+    if bg is None and h in ("status", "state", "overallstatus", "vsphere status"):
+        pair = _STATUS_FILL.get(key)
+        if pair:
+            bg, fg = pair
+    if bg is None and h in ("warn", "warning", "threshold", "breach"):
+        pair = _WARN_FILL.get(key) or (_WARN_FILL["ram"] if key and key != "ok" else _WARN_FILL.get("ok"))
+        if pair and key:
+            bg, fg = pair
+    return text, bg, fg
 
 
 def _parse_content(content: str | dict) -> dict:
@@ -408,42 +470,77 @@ class Tools:
                 rows = table.get("rows") or []
                 if headers and rows:
                     data = [[Paragraph(self._esc(h), styles["cell_h"]) for h in headers]]
-                    for r in rows:
+                    cell_colors: list[tuple[int, int, str, str]] = []  # row, col, bg, fg
+                    for ri, r in enumerate(rows, start=1):
                         if isinstance(r, dict):
-                            data.append(
-                                [
-                                    Paragraph(self._esc(r.get(h, "")), styles["cell"])
-                                    for h in headers
-                                ]
-                            )
+                            # keyed by header name OR list under "cells"
+                            if "cells" in r and isinstance(r["cells"], (list, tuple)):
+                                vals = list(r["cells"])
+                                while len(vals) < len(headers):
+                                    vals.append("")
+                                row_vals = vals[: len(headers)]
+                            else:
+                                row_vals = [r.get(h, "") for h in headers]
                         else:
                             vals = list(r) if isinstance(r, (list, tuple)) else [r]
                             while len(vals) < len(headers):
                                 vals.append("")
-                            data.append(
-                                [
-                                    Paragraph(self._esc(vals[i]), styles["cell"])
-                                    for i in range(len(headers))
-                                ]
-                            )
+                            row_vals = vals[: len(headers)]
+
+                        paras = []
+                        for ci, (hdr, raw) in enumerate(zip(headers, row_vals)):
+                            text, bg, fg = _cell_text_and_colors(raw, str(hdr))
+                            if bg and fg:
+                                # Paragraph ignores TableStyle TEXTCOLOR — bake colour into style
+                                cell_style = ParagraphStyle(
+                                    f"cell_{ri}_{ci}",
+                                    parent=styles["cell"],
+                                    textColor=_color(fg),
+                                    alignment=TA_CENTER,
+                                )
+                                paras.append(Paragraph(self._esc(text), cell_style))
+                            else:
+                                paras.append(Paragraph(self._esc(text), styles["cell"]))
+                            if bg:
+                                cell_colors.append((ri, ci, bg, fg or "111827"))
+                        data.append(paras)
+
+                    # explicit cell_styles in table JSON (row is 1-based data row, col 0-based)
+                    for st in table.get("cell_styles") or []:
+                        if not isinstance(st, dict):
+                            continue
+                        try:
+                            rr = int(st.get("row", 0))
+                            cc = int(st.get("col", -1))
+                        except (TypeError, ValueError):
+                            continue
+                        if rr < 1 or cc < 0 or cc >= len(headers):
+                            continue
+                        bg = _hex(str(st.get("bg") or ""), "")
+                        if not bg:
+                            continue
+                        fg = _hex(str(st.get("fg") or "111827"), "111827")
+                        cell_colors.append((rr, cc, bg, fg))
+
                     col_w = (page[0] - 32 * mm) / max(len(headers), 1)
                     t = Table(data, colWidths=[col_w] * len(headers), repeatRows=1)
-                    t.setStyle(
-                        TableStyle(
-                            [
-                                ("BACKGROUND", (0, 0), (-1, 0), _color(theme["primary"])),
-                                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D1D5DB")),
-                                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-                                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
-                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                            ]
-                        )
-                    )
+                    style_cmds = [
+                        ("BACKGROUND", (0, 0), (-1, 0), _color(theme["primary"])),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D1D5DB")),
+                        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ]
+                    for ri, ci, bg, fg in cell_colors:
+                        style_cmds.append(("BACKGROUND", (ci, ri), (ci, ri), _color(bg)))
+                        style_cmds.append(("TEXTCOLOR", (ci, ri), (ci, ri), _color(fg)))
+                        style_cmds.append(("ALIGN", (ci, ri), (ci, ri), "CENTER"))
+                    t.setStyle(TableStyle(style_cmds))
                     block.append(Spacer(1, 3 * mm))
                     block.append(t)
 
@@ -531,57 +628,97 @@ class Tools:
     async def generate_pdf(
         self,
         content: str = "{}",
+        source_file_id: str = "",
+        source_filename: str = "",
+        job: str = "",
+        sheet_name: str = "",
+        group_by: str = "Subject",
+        __files__: Optional[list] = None,
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __request__: Any = None,
     ) -> str:
-        """Create a native PDF report and return a download link. Use whenever the
-        user asks for a PDF, report PDF, printable report, or similar.
+        """Create a native PDF report and return a download link.
 
-        The `content` parameter MUST be a SINGLE JSON string (no markdown fence).
-        Structure:
+        FULL-FILE RULE: when a spreadsheet is attached, call with
+        job='subject_group_report' so the tool reads the COMPLETE file on disk.
+        Never invent tables from RAG snippets.
 
-        {
-          "title": "Report title",
-          "subtitle": "optional",
-          "author": "School / name",
-          "theme": "navy",
-          "orientation": "portrait",
-          "footer": "Students Progress Report 2026",
-          "sections": [
-            {
-              "heading": "KPIs",
-              "stats": [{"value": "51%", "label": "On target"}],
-              "body": "optional paragraph",
-              "bullets": ["point 1", "point 2"],
-              "table": {
-                "headers": ["Name", "Forecast", "CAIE", "Δ"],
-                "rows": [["Aisha", "A", "B", "-1"]]
-              },
-              "page_break": false
-            }
-          ],
-          "closing": {
-            "title": "Recommendations",
-            "takeaways": ["..."]
-          }
-        }
-
-        DESIGN: Prefer navy theme for Intellect/Ghazala reports. Keep tables readable.
-        Reproduce the returned markdown link EXACTLY (do NOT prefix sandbox:).
+        Blank/new PDF JSON content still supported when no source job.
+        No emojis in tables. Reproduce download link EXACTLY.
         """
         if not _HAS_RL:
             return (
                 "[TOOL_RESULT — use as final reply]\n\n"
                 "I couldn't generate the PDF: reportlab is not installed."
             )
-        try:
-            spec = _parse_content(content)
-        except Exception as exc:
-            return (
-                "[TOOL_RESULT — use as final reply]\n\n"
-                f"Invalid JSON for generate_pdf: {exc}"
-            )
+
+        verify_md = ""
+        job_l = (job or "").strip().lower()
+        if (source_file_id or source_filename or job_l) and job_l in (
+            "",
+            "subject_group_report",
+            "subjectwise",
+            "subject_wise",
+            "subject-wise",
+        ):
+            job_l = job_l or "subject_group_report"
+
+        if job_l in ("subject_group_report", "subjectwise", "subject_wise", "subject-wise"):
+            try:
+                sw = _load_source_lib()
+                uid = __user__.get("id") if isinstance(__user__, dict) else None
+                fid, filename, path = sw.resolve_file_path(
+                    source_file_id=source_file_id,
+                    source_filename=source_filename,
+                    files=__files__ or [],
+                    user_id=uid,
+                )
+                book = sw.load_workbook_rows(path)
+                title = "Subject-wise Report"
+                try:
+                    meta = (
+                        _parse_content(content)
+                        if content and content.strip() not in ("{}", "")
+                        else {}
+                    )
+                    if isinstance(meta, dict) and meta.get("title"):
+                        title = str(meta["title"])
+                except Exception:
+                    pass
+                built = sw.build_subject_group_report(
+                    book,
+                    sheet_name=sheet_name or "Form Responses 1",
+                    group_by=group_by or "Subject",
+                    title=title,
+                )
+                spec = built["pdf"]
+                spec.setdefault("theme", "navy")
+                verify_md = sw.verify_block_markdown(built["verify"], fid, filename)
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"FULL_FILE_READ failed: {exc}"
+                )
+        else:
+            try:
+                spec = _parse_content(content)
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"Invalid JSON for generate_pdf: {exc}"
+                )
+            if __files__:
+                for item in __files__ or []:
+                    if not isinstance(item, dict):
+                        continue
+                    n = str(item.get("filename") or item.get("name") or "").lower()
+                    if n.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                        return (
+                            "[TOOL_RESULT — use as final reply]\n\n"
+                            "Spreadsheet attached — call generate_pdf with "
+                            "job='subject_group_report' for FULL_FILE_READ."
+                        )
 
         if __event_emitter__:
             try:
@@ -612,6 +749,7 @@ class Tools:
             )
 
         kb = max(1, len(pdf_bytes) // 1024)
+        head = verify_md + "\n\n" if verify_md else ""
         if __event_emitter__:
             try:
                 await __event_emitter__(
@@ -620,6 +758,7 @@ class Tools:
                         "data": {
                             "content": (
                                 f"\n\n---\n\n📄 **PDF ready** · {kb} KB\n\n"
+                                f"{head}"
                                 f"⬇️ [Download {fname}]({url})\n\n---\n"
                             )
                         },
@@ -634,6 +773,7 @@ class Tools:
         return (
             "[TOOL_RESULT — reproduce the markdown link EXACTLY as written below "
             "(do NOT change the URL, do NOT prefix sandbox:). Do not include this line.]\n\n"
+            f"{head}"
             "Here is the PDF report:\n\n"
             f"[{fname}]({url})"
         )

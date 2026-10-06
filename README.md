@@ -55,11 +55,11 @@ Everyone else gets **OmniTech Chat** (Open WebUI).
 
 | Capability | Notes |
 |---|---|
-| **Generate Forecast Pack** | Multi-sheet Excel (Summary / AS / A2 / Variance + colours) |
-| **Generate Slides / PDF / Word / Excel** | Native office files via OWUI Files API |
+| **Generate Forecast Pack** | Multi-sheet Excel (Summary / AS / A2 / Variance + colours); **FULL_FILE_READ** via `job=forecast_from_source` |
+| **Generate Slides / PDF / Word / Excel** | Native office files via OWUI Files API; attached sheets → `job=subject_group_report` (complete disk read) |
 | **Web Search** | DuckDuckGo; toggle in Tools grid |
 | **Code Interpreter** | Optional Jupyter sidecar |
-| **Model profiles** | e.g. `auto/best-fast`, `auto/best-coding` via OmniRoute |
+| **Model profiles** | e.g. `auto/best-fast`, `auto/best-coding` via OmniRoute (harden providers to avoid combo burn) |
 
 ![Chat + Web Search / Code Interpreter](assets/webui-interface-1.png)
 
@@ -80,6 +80,8 @@ Full write-up: **[docs/CHALLENGES-AND-FIXES.md](docs/CHALLENGES-AND-FIXES.md)**
 | Host dirty reboots (MCE / CMCI) | Remove mixed 4GB+16GB RAM; matched DIMMs; `mce_watch`; softdog watchdog |
 | After reboot stack “forgot” wiring | Boot heal scripts / compose env that survives recreate |
 | OmniConnect Redis clash | Never steal host Redis **6379** for other stacks |
+| Subject-wise Excel incomplete (RAG invent) | **FULL_FILE_READ** — tools read complete `.xlsx`; `job=subject_group_report` / `forecast_from_source` |
+| Same-chat “cooling down” / Maximum combo | Harden OmniRoute: keep only proven providers ON; `harden_bestfast_combo.py` |
 
 ---
 

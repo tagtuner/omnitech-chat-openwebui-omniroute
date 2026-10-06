@@ -1,10 +1,10 @@
 """
 title: Generate Word
 author: OmniTech
-description: Generate native Word (.docx) documents from a JSON spec.
+description: Generate native Word (.docx). Prefer FULL attached-file read via source_file_id/job.
 requirements: python-docx
 required_open_webui_version: 0.4.0
-version: 1.0.0
+version: 2.0.0
 license: MIT
 """
 
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -32,6 +33,19 @@ try:
     _HAS_DOCX = True
 except Exception:
     _HAS_DOCX = False
+
+
+def _load_source_lib():
+    for p in (
+        "/app/backend/data",
+        "/opt/open-webui/tools",
+        os.path.dirname(os.path.abspath(__file__)),
+    ):
+        if p and p not in sys.path and os.path.isdir(p):
+            sys.path.insert(0, p)
+    import lib_source_workbook as sw  # type: ignore
+
+    return sw
 
 
 def _slugify(text: str) -> str:
@@ -281,34 +295,89 @@ class Tools:
     async def generate_docx(
         self,
         content: str = "{}",
+        source_file_id: str = "",
+        source_filename: str = "",
+        job: str = "",
+        sheet_name: str = "",
+        group_by: str = "Subject",
+        __files__: Optional[list] = None,
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __request__: Any = None,
     ) -> str:
         """Create a native Word (.docx) document and return a download link.
-        Use when the user asks for Word, DOCX, a written report document, or similar.
 
-        `content` MUST be a SINGLE JSON string (no markdown fence):
-        {
-          "title": "...", "subtitle": "...", "author": "...",
-          "sections": [
-            {"heading":"...","body":"...","bullets":["..."],
-             "stats":[{"value":"51%","label":"On target"}],
-             "table":{"headers":["A","B"],"rows":[["1","2"]]}}
-          ],
-          "closing":{"title":"Recommendations","takeaways":["..."]}
-        }
-        Reproduce the returned markdown link EXACTLY (do NOT prefix sandbox:).
+        FULL-FILE RULE: when a spreadsheet is attached, call with
+        job='subject_group_report' (reads COMPLETE file on disk). Never invent
+        tables from RAG snippets.
+
+        Optional blank-doc JSON content when no source job:
+        { "title":"...", "sections":[{"heading":"...","bullets":["..."]}] }
         """
         if not _HAS_DOCX:
             return (
                 "[TOOL_RESULT — use as final reply]\n\n"
                 "I couldn't generate the Word file: python-docx is not installed."
             )
-        try:
-            spec = _parse_content(content)
-        except Exception as exc:
-            return f"[TOOL_RESULT — use as final reply]\n\nInvalid JSON for generate_docx: {exc}"
+
+        verify_md = ""
+        job_l = (job or "").strip().lower()
+        if (source_file_id or source_filename or job_l) and job_l in (
+            "",
+            "subject_group_report",
+            "subjectwise",
+            "subject_wise",
+            "subject-wise",
+        ):
+            job_l = job_l or "subject_group_report"
+
+        if job_l in ("subject_group_report", "subjectwise", "subject_wise", "subject-wise"):
+            try:
+                sw = _load_source_lib()
+                uid = __user__.get("id") if isinstance(__user__, dict) else None
+                fid, filename, path = sw.resolve_file_path(
+                    source_file_id=source_file_id,
+                    source_filename=source_filename,
+                    files=__files__ or [],
+                    user_id=uid,
+                )
+                book = sw.load_workbook_rows(path)
+                title = "Subject-wise Report"
+                try:
+                    meta = _parse_content(content) if content and content.strip() not in ("{}", "") else {}
+                    if isinstance(meta, dict) and meta.get("title"):
+                        title = str(meta["title"])
+                except Exception:
+                    pass
+                built = sw.build_subject_group_report(
+                    book,
+                    sheet_name=sheet_name or "Form Responses 1",
+                    group_by=group_by or "Subject",
+                    title=title,
+                )
+                spec = built["docx"]
+                verify_md = sw.verify_block_markdown(built["verify"], fid, filename)
+            except Exception as exc:
+                return (
+                    "[TOOL_RESULT — use as final reply]\n\n"
+                    f"FULL_FILE_READ failed: {exc}"
+                )
+        else:
+            try:
+                spec = _parse_content(content)
+            except Exception as exc:
+                return f"[TOOL_RESULT — use as final reply]\n\nInvalid JSON for generate_docx: {exc}"
+            if __files__:
+                for item in __files__ or []:
+                    if not isinstance(item, dict):
+                        continue
+                    n = str(item.get("filename") or item.get("name") or "").lower()
+                    if n.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                        return (
+                            "[TOOL_RESULT — use as final reply]\n\n"
+                            "Spreadsheet attached — call generate_docx with "
+                            "job='subject_group_report' for FULL_FILE_READ."
+                        )
 
         if __event_emitter__:
             try:
@@ -328,6 +397,7 @@ class Tools:
             return f"[TOOL_RESULT — use as final reply]\n\nDOCX built but save failed: {err}"
 
         kb = max(1, len(data) // 1024)
+        head = verify_md + "\n\n" if verify_md else ""
         if __event_emitter__:
             try:
                 await __event_emitter__(
@@ -336,6 +406,7 @@ class Tools:
                         "data": {
                             "content": (
                                 f"\n\n---\n\n📝 **Word document ready** · {kb} KB\n\n"
+                                f"{head}"
                                 f"⬇️ [Download {fname}]({url})\n\n---\n"
                             )
                         },
@@ -350,6 +421,7 @@ class Tools:
         return (
             "[TOOL_RESULT — reproduce the markdown link EXACTLY as written below "
             "(do NOT change the URL, do NOT prefix sandbox:). Do not include this line.]\n\n"
+            f"{head}"
             "Here is the Word document:\n\n"
             f"[{fname}]({url})"
         )
